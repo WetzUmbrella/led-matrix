@@ -172,7 +172,10 @@ _(last updated 2026-09-18)_
 - [x] Repo pushed to GitHub, public
 - [x] ESP-NOW-based controller/peer sync architecture designed and implemented (`main/esp_now_sync.{c,h}`, `main/led_matrix.{c,h}`, `main/Kconfig.projbuild`, rewritten `main/led-matrix.c`)
 - [x] Both the controller build and the peer build compile cleanly (`idf.py build`, verified by toggling `CONFIG_LM_ROLE_*` and rebuilding)
-- [ ] **Not yet run on real hardware at all** — no boards were available while this sync code was written; the whole multi-board flow (role/position/peer-MAC `menuconfig` config, flashing 4 boards, ESP-NOW pairing, and whether it actually holds 60fps without tearing at the seams) is unverified.
+- [x] **Single-board Controller-role smoke test run on real hardware and visually verified** — one board flashed as Controller with all 4 peer-MAC fields set to distinct dummy values, dot renders correctly on the board's own quadrant. Sends to the 3 fake peers fail harmlessly (logged `esp_now_send failed` warnings), as designed.
+- [ ] **Multi-board (4-board) flow still unverified** — role/position/real-peer-MAC `menuconfig` config, flashing all 4, ESP-NOW pairing, and whether it actually holds 60fps without tearing at the seams.
+
+**Known bug found during single-board testing:** `lm_espnow_register_peers()` in `main/esp_now_sync.c` loops over all 4 grid positions and calls `esp_now_add_peer()` for each, wrapped in `ESP_ERROR_CHECK()`. If two positions share the same MAC (e.g. all 4 left at the default placeholder `AA:AA:AA:AA:AA:AA`, as happens by default on an unconfigured board), the second `esp_now_add_peer()` call returns `ESP_ERR_ESPNOW_EXIST`, and `ESP_ERROR_CHECK` aborts, causing an infinite crash-reboot loop with **no board-level symptom other than "nothing happens."** The Kconfig help text says a controller's own-position peer entry is "ignored," but the code never actually skips registering a peer for `OWN_POSITION` — it should, both to honor that comment and to avoid this crash. Workaround used for single-board testing: give all 4 peer-MAC fields distinct dummy values. **TODO:** fix `lm_espnow_register_peers()` to skip `OWN_POSITION`, and/or tolerate `ESP_ERR_ESPNOW_EXIST` instead of hard-aborting.
 
 **To pick this up (same machine or a second machine, e.g. a PC after setting it up on a laptop):**
 
