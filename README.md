@@ -93,3 +93,23 @@ led-matrix/
 
 `build/`, `managed_components/`, `sdkconfig`, `sdkconfig.old`, and
 `dependencies.lock` are all regenerated locally and are gitignored.
+
+## Current Status / Next Steps
+
+_(last updated 2026-09-18)_
+
+- [x] ESP-IDF v5.3 installed at `~/esp/esp-idf` (WSL), `get_idf` alias set up
+- [x] Project scaffolded, target set to `esp32s3`, `led_strip` dependency added
+- [x] Walking-dot LED code written (`main/led-matrix.c`)
+- [x] `idf.py build` verified successful (compiles clean, `led_strip` resolves)
+- [x] Repo pushed to GitHub, public
+- [ ] **Flash + visual confirmation** — not done yet, board wasn't available this session
+
+**To pick this up (same machine or a second machine, e.g. a PC after setting it up on a laptop):**
+
+1. If this is a machine that hasn't been set up before: work through Prerequisites → step 5 above first (WSL2+Ubuntu, `usbipd-win`, ESP-IDF v5.3 install, clone this repo, `set-target esp32s3`, `idf.py build`). Machine-level installs (WSL, `usbipd-win`, ESP-IDF itself, `gh` CLI) are per-machine and are **not** carried by git — each new machine needs them installed fresh; only this repo's contents come from `git clone`.
+2. Plug in the board, then in an admin PowerShell: `usbipd list` → note the BUSID → `usbipd bind --busid <BUSID>` → `usbipd attach --wsl --busid <BUSID>`.
+3. In WSL, confirm it shows up: `ls /dev/ttyACM0`.
+4. `get_idf && idf.py -p /dev/ttyACM0 flash monitor`.
+5. Confirm visually: exactly one dim (~10% brightness) pixel lit at a time, walking through all 64 LEDs in sequence, looping. If it hangs at "Connecting...", hold BOOT, tap RESET, release BOOT, retry.
+6. Once confirmed, update this checklist and commit.
