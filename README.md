@@ -6,6 +6,20 @@ ESP32-S3-Matrix board (GPIO14, 64 LEDs). Built with ESP-IDF v5.3.
 Scope: LED matrix only. The board's onboard QMI8658 IMU (I2C GPIO11/12) is
 not used here.
 
+## Project Context
+
+This is **single-node firmware** — it drives one board's 8x8 matrix in
+isolation. It's a building block for a larger "Distributed LED Matrix Video
+Wall" project: the original plan was a single 16x16 matrix, but hardware
+issues forced a pivot to **4x ESP32-S3-Matrix boards (8x8 each), tiled 2x2**
+to cover the same 16x16 area, mounted in a 3D-printed case/plate. Each board
+is its own independent node.
+
+**Not yet decided:** how the 4 boards will coordinate to display one
+coherent image across the grid (e.g. ESP-NOW, WiFi/MQTT, a wired signal, or
+a designated controller board) — this repo doesn't implement any
+inter-board sync yet.
+
 ## What it does
 
 Lights a single pixel at ~10% brightness (dim white) and walks it through
