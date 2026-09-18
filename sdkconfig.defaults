@@ -1,0 +1,3 @@
+# Intentionally minimal -- this project has no non-default sdkconfig requirements.
+# Flash size auto-detection is already the ESP-IDF default (CONFIG_ESPTOOLPY_FLASHSIZE_DETECT=y).
+# Target (esp32s3) is set via `idf.py set-target esp32s3`, which teammates must run once after cloning.
