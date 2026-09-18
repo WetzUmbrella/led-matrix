@@ -1,0 +1,62 @@
+menu "LED Matrix Video Wall"
+
+    choice LM_ROLE
+        prompt "Board role"
+        default LM_ROLE_PEER
+        help
+            Exactly one board in the 2x2 grid should be the CONTROLLER --
+            it generates the shared animation and pushes each quadrant's
+            pixels to the other 3 boards over ESP-NOW, and drives its own
+            quadrant locally. The other 3 boards are PEERs: they just
+            render whatever quadrant they're sent.
+
+        config LM_ROLE_CONTROLLER
+            bool "Controller (generates frames, drives 1 quadrant + sends to 3 peers)"
+        config LM_ROLE_PEER
+            bool "Peer (renders one quadrant received over ESP-NOW)"
+    endchoice
+
+    choice LM_POSITION
+        prompt "This board's position in the 2x2 grid"
+        default LM_POSITION_TOP_LEFT
+        help
+            Which quadrant of the 16x16 canvas this board's 8x8 matrix
+            covers. Used as a sanity check against incoming ESP-NOW packets,
+            and to pick this board's own slice if it's the controller.
+
+        config LM_POSITION_TOP_LEFT
+            bool "Top-left"
+        config LM_POSITION_TOP_RIGHT
+            bool "Top-right"
+        config LM_POSITION_BOTTOM_LEFT
+            bool "Bottom-left"
+        config LM_POSITION_BOTTOM_RIGHT
+            bool "Bottom-right"
+    endchoice
+
+    config LM_ESPNOW_CHANNEL
+        int "WiFi channel used for ESP-NOW (must match on all 4 boards)"
+        range 1 13
+        default 1
+
+    if LM_ROLE_CONTROLLER
+
+        config LM_PEER_TOP_LEFT_MAC
+            string "Peer MAC: top-left board (ignored if controller IS top-left)"
+            default "AA:AA:AA:AA:AA:AA"
+
+        config LM_PEER_TOP_RIGHT_MAC
+            string "Peer MAC: top-right board (ignored if controller IS top-right)"
+            default "AA:AA:AA:AA:AA:AA"
+
+        config LM_PEER_BOTTOM_LEFT_MAC
+            string "Peer MAC: bottom-left board (ignored if controller IS bottom-left)"
+            default "AA:AA:AA:AA:AA:AA"
+
+        config LM_PEER_BOTTOM_RIGHT_MAC
+            string "Peer MAC: bottom-right board (ignored if controller IS bottom-right)"
+            default "AA:AA:AA:AA:AA:AA"
+
+    endif
+
+endmenu

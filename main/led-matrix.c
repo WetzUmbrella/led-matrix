@@ -1,59 +1,112 @@
-#include <stdio.h>
+#include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "led_strip.h"
+#include "esp_timer.h"
 #include "esp_log.h"
+#include "sdkconfig.h"
 
-static const char *TAG = "led_matrix";
+#include "led_matrix.h"
+#include "esp_now_sync.h"
 
-#define LED_STRIP_GPIO_PIN      14
-#define LED_STRIP_LED_COUNT     64                 // 8x8 WS2812 matrix
-#define LED_STRIP_RMT_RES_HZ    (10 * 1000 * 1000) // 10MHz RMT tick resolution (standard for WS2812 timing)
-#define STEP_DELAY_MS           100
+static const char *TAG = "led_matrix_wall";
 
-// Brightness cap: the lit pixel's R=G=B channels are set directly to this
-// value instead of scaling a full-brightness color at runtime.
-// 25 / 255 ~= 9.8%, i.e. a dim white at ~10% max brightness.
-#define MAX_BRIGHTNESS          25
+#define GRID_W          16
+#define GRID_H          16
+#define GRID_LEDS       (GRID_W * GRID_H)
+#define FRAME_PERIOD_US (1000000 / 60) // 60fps target
+#define MAX_BRIGHTNESS  25             // ~10% of 255, matches the single-node demo
+
+#if CONFIG_LM_POSITION_TOP_LEFT
+#define OWN_POSITION LM_POS_TOP_LEFT
+#elif CONFIG_LM_POSITION_TOP_RIGHT
+#define OWN_POSITION LM_POS_TOP_RIGHT
+#elif CONFIG_LM_POSITION_BOTTOM_LEFT
+#define OWN_POSITION LM_POS_BOTTOM_LEFT
+#else
+#define OWN_POSITION LM_POS_BOTTOM_RIGHT
+#endif
+
+static led_strip_handle_t s_strip;
+
+#if CONFIG_LM_ROLE_CONTROLLER
+
+static TaskHandle_t s_render_task;
+
+static void tick_timer_cb(void *arg)
+{
+    // esp_timer callbacks run in the (non-ISR) esp_timer task by default,
+    // so a plain task notification is enough to wake the render task.
+    xTaskNotifyGive(s_render_task);
+}
+
+// Maps a lit pixel in the shared 16x16 canvas to its quadrant + local index,
+// then walks it one step further for the next tick. A single dot walking
+// across all 256 positions (raster order) is deliberately simple: any
+// stutter or misalignment at a quadrant seam is immediately visible, which
+// is the point -- this is meant to expose sync problems, not hide them.
+static void render_task(void *arg)
+{
+    uint8_t quadrant_rgb[LM_POS_COUNT][LM_QUADRANT_BYTES];
+    uint32_t frame_seq = 0;
+    int dot = 0;
+
+    while (1) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+        memset(quadrant_rgb, 0, sizeof(quadrant_rgb));
+
+        int x = dot % GRID_W;
+        int y = dot / GRID_W;
+        lm_position_t pos = (x < 8)
+            ? (y < 8 ? LM_POS_TOP_LEFT : LM_POS_BOTTOM_LEFT)
+            : (y < 8 ? LM_POS_TOP_RIGHT : LM_POS_BOTTOM_RIGHT);
+        int local_idx = (y % 8) * 8 + (x % 8);
+        quadrant_rgb[pos][local_idx * 3 + 0] = MAX_BRIGHTNESS;
+        quadrant_rgb[pos][local_idx * 3 + 1] = MAX_BRIGHTNESS;
+        quadrant_rgb[pos][local_idx * 3 + 2] = MAX_BRIGHTNESS;
+
+        for (int p = 0; p < LM_POS_COUNT; p++) {
+            if (p == OWN_POSITION) {
+                continue; // rendered locally below, never sent to self
+            }
+            lm_espnow_send_quadrant((lm_position_t)p, frame_seq, quadrant_rgb[p]);
+        }
+        lm_led_matrix_show(s_strip, quadrant_rgb[OWN_POSITION]);
+
+        frame_seq++;
+        dot = (dot + 1) % GRID_LEDS;
+    }
+}
+
+#else // peer
+
+static void on_frame_received(const lm_frame_packet_t *packet)
+{
+    lm_led_matrix_show(s_strip, packet->pixels);
+}
+
+#endif
 
 void app_main(void)
 {
-    led_strip_handle_t led_strip;
+    lm_espnow_init();
+    s_strip = lm_led_matrix_init(14);
 
-    led_strip_config_t strip_config = {
-        .strip_gpio_num = LED_STRIP_GPIO_PIN,
-        .max_leds = LED_STRIP_LED_COUNT,
-        .led_pixel_format = LED_PIXEL_FORMAT_GRB,
-        .led_model = LED_MODEL_WS2812,
-        .flags.invert_out = false,
+#if CONFIG_LM_ROLE_CONTROLLER
+    xTaskCreate(render_task, "render", 4096, NULL, configMAX_PRIORITIES - 2, &s_render_task);
+    lm_espnow_register_peers();
+
+    const esp_timer_create_args_t timer_args = {
+        .callback = &tick_timer_cb,
+        .name = "frame_tick",
     };
-
-    led_strip_rmt_config_t rmt_config = {
-        .clk_src = RMT_CLK_SRC_DEFAULT,
-        .resolution_hz = LED_STRIP_RMT_RES_HZ,
-        .flags.with_dma = false,
-    };
-
-    ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_config, &rmt_config, &led_strip));
-    ESP_ERROR_CHECK(led_strip_clear(led_strip));
-
-    ESP_LOGI(TAG, "LED matrix initialized on GPIO%d, %d LEDs, walking dot test starting",
-             LED_STRIP_GPIO_PIN, LED_STRIP_LED_COUNT);
-
-    // Walks a single lit pixel through all 64 indices in simple linear/raster
-    // order (index 0 -> 63, following chain order as wired). This does NOT
-    // account for serpentine/boustrophedon wiring some 8x8 matrices use where
-    // alternate rows are reversed -- if the physical walk visibly "jumps back"
-    // at a row boundary instead of continuing smoothly, the matrix is wired
-    // serpentine and the index math would need a row/col remap.
-    int current = 0;
-    while (1) {
-        ESP_ERROR_CHECK(led_strip_clear(led_strip));
-        ESP_ERROR_CHECK(led_strip_set_pixel(led_strip, current,
-                                             MAX_BRIGHTNESS, MAX_BRIGHTNESS, MAX_BRIGHTNESS));
-        ESP_ERROR_CHECK(led_strip_refresh(led_strip));
-
-        current = (current + 1) % LED_STRIP_LED_COUNT;
-        vTaskDelay(pdMS_TO_TICKS(STEP_DELAY_MS));
-    }
+    esp_timer_handle_t timer;
+    ESP_ERROR_CHECK(esp_timer_create(&timer_args, &timer));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(timer, FRAME_PERIOD_US));
+    ESP_LOGI(TAG, "Controller running: position %d, target %d fps",
+             OWN_POSITION, 1000000 / FRAME_PERIOD_US);
+#else
+    lm_espnow_set_receive_handler(OWN_POSITION, on_frame_received);
+    ESP_LOGI(TAG, "Peer running: waiting for quadrant %d frames over ESP-NOW", OWN_POSITION);
+#endif
 }

@@ -1,24 +1,53 @@
 # led-matrix
 
-Walking-dot test for the onboard 8x8 WS2812 LED matrix on a Waveshare
-ESP32-S3-Matrix board (GPIO14, 64 LEDs). Built with ESP-IDF v5.3.
+Firmware for a 2x2 grid of Waveshare ESP32-S3-Matrix boards (8x8 WS2812
+each, GPIO14, 64 LEDs per board) that together display one synced animation
+across a 16x16 canvas. Built with ESP-IDF v5.3.
 
-Scope: LED matrix only. The board's onboard QMI8658 IMU (I2C GPIO11/12) is
-not used here.
+Scope: LED matrix + inter-board sync only. Each board's onboard QMI8658 IMU
+(I2C GPIO11/12) is not used here.
 
 ## Project Context
 
-This is **single-node firmware** — it drives one board's 8x8 matrix in
-isolation. It's a building block for a larger "Distributed LED Matrix Video
-Wall" project: the original plan was a single 16x16 matrix, but hardware
-issues forced a pivot to **4x ESP32-S3-Matrix boards (8x8 each), tiled 2x2**
-to cover the same 16x16 area, mounted in a 3D-printed case/plate. Each board
-is its own independent node.
+This is a building block for a larger "Distributed LED Matrix Video Wall"
+project: the original plan was a single 16x16 matrix, but hardware issues
+forced a pivot to **4x ESP32-S3-Matrix boards (8x8 each), tiled 2x2** to
+cover the same 16x16 area, mounted in a 3D-printed case/plate (planned for
+later). The team's current focus is getting the 4 boards **synced at
+60fps**, as the embedded-systems showcase for the course; the case and
+other polish are deferred.
 
-**Not yet decided:** how the 4 boards will coordinate to display one
-coherent image across the grid (e.g. ESP-NOW, WiFi/MQTT, a wired signal, or
-a designated controller board) — this repo doesn't implement any
-inter-board sync yet.
+## Architecture
+
+One board is configured as the **controller**, the other three as **peers**:
+
+- The controller generates the shared animation (currently: a single dot
+  walking across all 256 positions of the 16x16 canvas, raster order, one
+  step every frame tick) at a fixed 60fps tick driven by an `esp_timer`
+  periodic timer + a FreeRTOS task notification.
+- Each tick, the controller splits the 16x16 frame into 4 quadrant buffers
+  (8x8 RGB each) and **unicasts** the 3 quadrants it doesn't own to the
+  other boards over **ESP-NOW** (no WiFi AP/router needed), then renders
+  its own quadrant locally.
+- Each peer just renders whatever quadrant packet it receives, as soon as
+  it arrives — no separate timer on peers.
+- A single lit pixel walking across the whole grid makes any sync problem
+  immediately visible: it should cross quadrant boundaries smoothly, with
+  no stutter, jump, or duplicate/missing frame at the seams. That's
+  deliberate — the point of this pattern is to expose timing bugs, not
+  hide them.
+- ESP-NOW packets are tiny (197 bytes: a frame sequence number + quadrant
+  ID + 192 bytes of pixel data), well under ESP-NOW's 250-byte limit, and
+  WiFi modem sleep is disabled so delivery latency stays well under the
+  16.7ms (60fps) frame budget.
+
+**Not yet validated on real hardware** (no boards were available while
+writing this) — see the Status section below.
+
+Key files: `main/led-matrix.c` (app_main, role branching, the frame/render
+loop), `main/led_matrix.{c,h}` (thin LED-strip driver wrapper), `main/
+esp_now_sync.{c,h}` (ESP-NOW init, peer registration, send/receive),
+`main/Kconfig.projbuild` (per-board role/position/peer-MAC configuration).
 
 ## What it does
 
@@ -62,6 +91,28 @@ idf.py set-target esp32s3
 `espressif/led_strip` dependency; the component itself is NOT committed --
 it downloads automatically into `managed_components/` on your first build.
 
+### 3b. Configure this board's role (do this separately, per physical board)
+
+Each of the 4 boards needs its own build config -- run this once per board,
+on whichever machine is about to flash it:
+
+```bash
+idf.py menuconfig
+```
+
+Go to **LED Matrix Video Wall** and set:
+
+- **Board role**: exactly one board is `Controller`, the other three are `Peer`.
+- **This board's position**: which quadrant of the 16x16 grid this board covers.
+- **WiFi channel**: must be the *same* number on all 4 boards.
+- On the **controller only**: the MAC address of each of the other 3 boards
+  (grab each board's MAC from its boot log, e.g. `idf.py monitor`, or
+  `esp_read_mac()` -- the entry for the controller's own position is
+  ignored). Get all 3 MACs before doing this step.
+
+This writes to the local, gitignored `sdkconfig` -- it's intentionally not
+committed, since it's different per physical board.
+
 ### 4. Plug in the board and pass it into WSL (Windows admin PowerShell)
 
 ```powershell
@@ -99,8 +150,11 @@ led-matrix/
 ├── CMakeLists.txt
 ├── main/
 │   ├── CMakeLists.txt
+│   ├── Kconfig.projbuild
 │   ├── idf_component.yml
-│   └── led-matrix.c
+│   ├── led-matrix.c
+│   ├── led_matrix.{c,h}
+│   └── esp_now_sync.{c,h}
 ├── sdkconfig.defaults
 └── README.md
 ```
@@ -114,16 +168,18 @@ _(last updated 2026-09-18)_
 
 - [x] ESP-IDF v5.3 installed at `~/esp/esp-idf` (WSL), `get_idf` alias set up
 - [x] Project scaffolded, target set to `esp32s3`, `led_strip` dependency added
-- [x] Walking-dot LED code written (`main/led-matrix.c`)
-- [x] `idf.py build` verified successful (compiles clean, `led_strip` resolves)
+- [x] Single-board walking-dot LED code written and **flash-verified working** (`main/led-matrix.c`, before the sync rewrite below)
 - [x] Repo pushed to GitHub, public
-- [ ] **Flash + visual confirmation** — not done yet, board wasn't available this session
+- [x] ESP-NOW-based controller/peer sync architecture designed and implemented (`main/esp_now_sync.{c,h}`, `main/led_matrix.{c,h}`, `main/Kconfig.projbuild`, rewritten `main/led-matrix.c`)
+- [x] Both the controller build and the peer build compile cleanly (`idf.py build`, verified by toggling `CONFIG_LM_ROLE_*` and rebuilding)
+- [ ] **Not yet run on real hardware at all** — no boards were available while this sync code was written; the whole multi-board flow (role/position/peer-MAC `menuconfig` config, flashing 4 boards, ESP-NOW pairing, and whether it actually holds 60fps without tearing at the seams) is unverified.
 
 **To pick this up (same machine or a second machine, e.g. a PC after setting it up on a laptop):**
 
-1. If this is a machine that hasn't been set up before: work through Prerequisites → step 5 above first (WSL2+Ubuntu, `usbipd-win`, ESP-IDF v5.3 install, clone this repo, `set-target esp32s3`, `idf.py build`). Machine-level installs (WSL, `usbipd-win`, ESP-IDF itself, `gh` CLI) are per-machine and are **not** carried by git — each new machine needs them installed fresh; only this repo's contents come from `git clone`.
-2. Plug in the board, then in an admin PowerShell: `usbipd list` → note the BUSID → `usbipd bind --busid <BUSID>` → `usbipd attach --wsl --busid <BUSID>`.
-3. In WSL, confirm it shows up: `ls /dev/ttyACM0`.
-4. `get_idf && idf.py -p /dev/ttyACM0 flash monitor`.
-5. Confirm visually: exactly one dim (~10% brightness) pixel lit at a time, walking through all 64 LEDs in sequence, looping. If it hangs at "Connecting...", hold BOOT, tap RESET, release BOOT, retry.
-6. Once confirmed, update this checklist and commit.
+1. If this is a machine that hasn't been set up before: work through Prerequisites → step 3b above first (WSL2+Ubuntu, `usbipd-win`, ESP-IDF v5.3 install, clone this repo, `set-target esp32s3`, `idf.py build`). Machine-level installs (WSL, `usbipd-win`, ESP-IDF itself, `gh` CLI) are per-machine and are **not** carried by git — each new machine needs them installed fresh; only this repo's contents come from `git clone`.
+2. With all 4 boards in hand: flash each once as **Peer** (default config, just to read its MAC from the boot log via `idf.py monitor`), collecting all 4 MACs.
+3. Pick one board as **Controller**: run `idf.py menuconfig`, set its role/position, plug in the other 3 boards' MACs, reflash it.
+4. Reconfigure and reflash the other 3 as **Peer**, each with its own distinct grid position.
+5. Power all 4 simultaneously and confirm visually: a single dim (~10% brightness) pixel should walk smoothly across the full 16x16 grid, including across the seams between boards, with no stutter/jump/duplicate. If it hangs at "Connecting..." while flashing, hold BOOT, tap RESET, release BOOT, retry.
+6. If seams visibly desync or drop below 60fps, that's the next debugging target — check ESP-NOW send failures in the controller's log first (`esp_now_send failed` warnings), then timing jitter in the render loop.
+7. Once confirmed, update this checklist and commit.
