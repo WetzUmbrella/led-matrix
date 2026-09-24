@@ -1,0 +1,13 @@
+cmake_minimum_required(VERSION 3.13)
+set(PICO_BOARD pico_w)
+include(pico_sdk_import.cmake)
+project(ledwall_sync C CXX ASM)
+set(CMAKE_C_STANDARD 11)
+pico_sdk_init()
+
+add_executable(ledwall_sync main.c dhcpserver/dhcpserver.c)
+target_include_directories(ledwall_sync PRIVATE ${CMAKE_CURRENT_LIST_DIR} ${CMAKE_CURRENT_LIST_DIR}/dhcpserver)
+target_link_libraries(ledwall_sync pico_stdlib pico_cyw43_arch_lwip_threadsafe_background)
+pico_enable_stdio_usb(ledwall_sync 1)
+pico_enable_stdio_uart(ledwall_sync 0)
+pico_add_extra_outputs(ledwall_sync)
