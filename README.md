@@ -6,9 +6,16 @@ ESP32-S3-Matrix boards (8x8 WS2812 each, GPIO14, 64 LEDs per board), which
 together display one animation scaled and cropped to fill the whole grid.
 
 > **Older single-node design:** an earlier ESP-NOW controller/peer approach
-> (one board pushing quadrant data to the other three) was designed and
-> compiled but never hardware-tested, then abandoned in favor of the Pico W
-> design below. That code is preserved at tag [`v0-esp-now-single-node`](../../tree/v0-esp-now-single-node).
+> (one board pushing quadrant data to the other three) was designed, compiled,
+> and passed a single-board Controller smoke test, but was abandoned in favor
+> of the Pico W design below before the full 4-board flow was ever tried. That
+> code is preserved at tag [`v0-esp-now-single-node`](../../tree/v0-esp-now-single-node).
+> Testing on it did turn up a real bug worth remembering if any of that code
+> gets reused: `lm_espnow_register_peers()` in `main/esp_now_sync.c` didn't
+> skip the controller's own grid position when registering ESP-NOW peers, so
+> duplicate placeholder MACs (e.g. all left at the default) triggered
+> `ESP_ERR_ESPNOW_EXIST` inside an `ESP_ERROR_CHECK`, causing a silent
+> crash-reboot loop with no symptom beyond "the LEDs never light up."
 
 ## Project Context
 
