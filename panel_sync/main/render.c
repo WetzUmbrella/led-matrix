@@ -29,6 +29,10 @@
 // If the picture looks scrambled (every other row reversed), set this to 1
 #define MATRIX_SERPENTINE 0
 
+// Colour byte order the LEDs expect. 0 = RGB (Ben's board: red showed as green on GRB).
+// Set to 1 if red shows as green on YOUR board.
+#define LED_ORDER_GRB     0
+
 static const char *TAG = "render";
 static led_strip_handle_t strip;
 static render_state_fn get_state;
@@ -159,6 +163,11 @@ esp_err_t render_start(render_state_fn state_fn, int fps)
         .strip_gpio_num = LED_GPIO,
         .max_leds = LED_COUNT,
         .led_model = LED_MODEL_WS2812,
+#if LED_ORDER_GRB
+        .color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB,
+#else
+        .color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_RGB,
+#endif
     };
     led_strip_rmt_config_t rmt_cfg = {
         .clk_src = RMT_CLK_SRC_DEFAULT,
