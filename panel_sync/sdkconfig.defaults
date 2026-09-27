@@ -1,0 +1,4 @@
+# ESP32-S3-Matrix has 4MB flash. Custom partition table adds a 2MB "frames" area.
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"

@@ -9,7 +9,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "led_strip.h"
-#include "gif_frames.h"
+#include "frames.h"
 #include "render.h"
 
 #define LED_GPIO          14
@@ -37,6 +37,7 @@ static const char *TAG = "render";
 static led_strip_handle_t strip;
 static render_state_fn get_state;
 static int master_fps;
+static frame_set_t anim;           // what to play (frames.bin partition or built-in)
 
 /* ---------- pixel helpers ---------- */
 static inline uint8_t dim(uint8_t v) { return (uint16_t)v * BRIGHT / 255; }
@@ -55,16 +56,16 @@ static void clear_all(void)
 }
 
 /* ---------- GIF crop ---------- */
-// Draw this panel's piece of GIF frame idx.
-// The wall is a (cols*8) x (rows*8) canvas. The GIF is scaled to COVER it (fill + crop),
+// Draw this panel's piece of animation frame idx.
+// The wall is a (cols*8) x (rows*8) canvas. The animation is scaled to COVER it (fill + crop),
 // centred, and this panel samples the 8x8 block at its slot.
 static void draw_gif(int idx, int slot, int cols, int rows)
 {
     const float W = (float)(cols * PANEL_W);
     const float H = (float)(rows * PANEL_H);
-    const float s = fmaxf(W / GIF_W, H / GIF_H);           // cover scale
-    const float ox = (GIF_W * s - W) / 2.0f;               // crop offsets (centre)
-    const float oy = (GIF_H * s - H) / 2.0f;
+    const float s = fmaxf(W / anim.w, H / anim.h);         // cover scale
+    const float ox = (anim.w * s - W) / 2.0f;              // crop offsets (centre)
+    const float oy = (anim.h * s - H) / 2.0f;
     const int col = slot % cols;
     const int row = slot / cols;
 
@@ -75,10 +76,10 @@ static void draw_gif(int idx, int slot, int cols, int rows)
             int sx = (int)((cx + ox) / s);
             int sy = (int)((cy + oy) / s);
             if (sx < 0) sx = 0;
-            if (sx >= GIF_W) sx = GIF_W - 1;
+            if (sx >= anim.w) sx = anim.w - 1;
             if (sy < 0) sy = 0;
-            if (sy >= GIF_H) sy = GIF_H - 1;
-            const uint8_t *c = gif_frames[idx][sy][sx];
+            if (sy >= anim.h) sy = anim.h - 1;
+            const uint8_t *c = frame_px(&anim, idx, sx, sy);
             px(x, y, dim(c[0]), dim(c[1]), dim(c[2]));
         }
     }
@@ -142,7 +143,7 @@ static void render_task(void *arg)
                 draw_slot_number(st.slot + 1);
             } else {
                 uint64_t frame = st.frame_no + (uint64_t)(now - st.frame_rx_us) * master_fps / 1000000;
-                int idx = (int)((frame * GIF_FPS / master_fps) % GIF_FRAMES);
+                int idx = (int)((frame * anim.fps / master_fps) % anim.count);
                 draw_gif(idx, st.slot, st.cols, st.rows);
             }
             if (now - st.frame_rx_us > 1000000) px(0, 0, BRIGHT, 0, 0);   // red corner = lost the Pico
@@ -176,7 +177,8 @@ esp_err_t render_start(render_state_fn state_fn, int fps)
     esp_err_t err = led_strip_new_rmt_device(&strip_cfg, &rmt_cfg, &strip);
     if (err != ESP_OK) return err;
 
-    ESP_LOGI(TAG, "GIF: %d frames, %dx%d, %d fps", GIF_FRAMES, GIF_W, GIF_H, GIF_FPS);
+    frames_load(&anim);
+    ESP_LOGI(TAG, "GIF: %d frames, %dx%d, %d fps (%s)", anim.count, anim.w, anim.h, anim.fps, anim.source);
 
     if (xTaskCreatePinnedToCore(render_task, "render", RENDER_STACK, NULL,
                                 RENDER_PRIO, NULL, RENDER_CORE) != pdPASS)
