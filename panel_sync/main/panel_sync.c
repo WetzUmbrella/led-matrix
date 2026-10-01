@@ -1,10 +1,12 @@
 // LED wall panel firmware (same firmware on every panel)
-//  - joins the Pico's LEDWALL network
-//  - says HELLO to the Pico every 0.5s so it knows this panel is alive
+//  - joins the router (USE_ROUTER 1) or the Pico's own LEDWALL network (USE_ROUTER 0)
+//  - finds the Pico from the source address of its beacons (no hardcoded IP)
+//  - says HELLO to the Pico every 0.3s so it knows this panel is alive
 //  - reads the Pico's beacon: frame clock + layout (panel count, grid, who is in which slot)
 //  - draws its own piece of the GIF, re-splitting automatically when panels join or leave
 //  - flashes its slot number for 2s whenever the layout changes, so you know where to place it
 
+#include <stdio.h>
 #include <string.h>
 #include <stdbool.h>
 #include <inttypes.h>
@@ -18,18 +20,34 @@
 #include "esp_timer.h"
 #include "esp_mac.h"
 #include "nvs_flash.h"
+#include "nvs.h"
 #include "lwip/sockets.h"
 #include "led_strip.h"
 #include "gif_frames.h"
 
+#define USE_ROUTER       1           // must match the Pico. 0 = join the Pico's own access point
+
+#if USE_ROUTER
+// Router credentials live in wifi_secrets.h (git-ignored, copy wifi_secrets.example.h)
+#if __has_include("wifi_secrets.h")
+#include "wifi_secrets.h"
+#else
+#warning "wifi_secrets.h missing - using placeholder router credentials"
+#define ROUTER_SSID      "CHANGE_ME"
+#define ROUTER_PASS      "CHANGE_ME"
+#endif
+#define WIFI_SSID        ROUTER_SSID
+#define WIFI_PASS        ROUTER_PASS
+#else
 #define WIFI_SSID        "LEDWALL"
 #define WIFI_PASS        "ledwall123"
-#define PICO_IP          "192.168.4.1"
+#endif
+
 #define SYNC_PORT        4210
 #define HELLO_PORT       4211
 #define SYNC_MAGIC       0x4C454457
 #define HELLO_MAGIC      0x48454C4F
-#define PROTO_VERSION    2
+#define PROTO_VERSION    3           // must match the Pico. 3: HELLO carries the board number
 #define FPS              30          // must match the Pico
 #define MAX_NODES        8
 #define LED_GPIO         14
@@ -58,10 +76,12 @@ typedef struct __attribute__((packed)) {
 typedef struct __attribute__((packed)) {
     uint32_t magic;
     uint32_t id;
+    uint8_t  board;
 } hello_t;
 
 static const char *TAG = "panel";
 static uint32_t my_id;
+static uint8_t  my_board;            // from flash (set_board_number.sh), 0 = never set. Also my slot.
 
 // Shared between the receive task and the display loop
 static portMUX_TYPE lock = portMUX_INITIALIZER_UNLOCKED;
@@ -71,6 +91,7 @@ static bool     synced = false;
 static int      my_slot = -1;        // -1 = Pico hasn't listed us yet
 static int      cur_count = 0, cur_cols = 1, cur_rows = 1;
 static int      cur_layout_ver = -1;
+static volatile in_addr_t pico_addr = 0;   // learned from beacons, 0 = not heard yet
 
 /* ---------- WiFi ---------- */
 static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
@@ -78,11 +99,11 @@ static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
-        ESP_LOGW(TAG, "lost LEDWALL, retrying");
+        ESP_LOGW(TAG, "lost %s, retrying", WIFI_SSID);
         esp_wifi_connect();
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *e = (ip_event_got_ip_t *)data;
-        ESP_LOGI(TAG, "joined LEDWALL, IP " IPSTR, IP2STR(&e->ip_info.ip));
+        ESP_LOGI(TAG, "joined %s, IP " IPSTR, WIFI_SSID, IP2STR(&e->ip_info.ip));
     }
 }
 
@@ -95,9 +116,27 @@ static void wifi_init(void)
     }
     ESP_ERROR_CHECK(r);
 
+    // Board number written once by set_board_number.sh. It's this panel's router name (ESP-<n>)
+    // and its fixed slot in the wall. Stored in NVS, so normal reflashes never touch it.
+    static char hostname[16];
+    nvs_handle_t nvs;
+    if (nvs_open("board", NVS_READONLY, &nvs) == ESP_OK) {
+        nvs_get_u8(nvs, "number", &my_board);
+        nvs_close(nvs);
+    }
+    if (my_board) {
+        snprintf(hostname, sizeof(hostname), "ESP-%u", my_board);
+    } else {
+        snprintf(hostname, sizeof(hostname), "ESP-%08" PRIx32, my_id);
+        ESP_LOGW(TAG, "no board number set, the Pico won't give this panel a slot. "
+                      "Run ./set_board_number.sh <n>");
+    }
+    ESP_LOGI(TAG, "I am %s", hostname);
+
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_sta();
+    esp_netif_t *sta = esp_netif_create_default_wifi_sta();
+    esp_netif_set_hostname(sta, hostname);
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
@@ -107,7 +146,8 @@ static void wifi_init(void)
     wifi_config_t wc = { 0 };
     memcpy(wc.sta.ssid, WIFI_SSID, strlen(WIFI_SSID));
     memcpy(wc.sta.password, WIFI_PASS, strlen(WIFI_PASS));
-    wc.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    wc.sta.threshold.authmode = WIFI_PASS[0] ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;   // "" = open network
+    wc.sta.pmf_cfg.capable = true;   // lets us join WPA2/WPA3 mixed-mode routers
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wc));
@@ -123,11 +163,12 @@ static void hello_task(void *arg)
         .sin_family = AF_INET,
         .sin_port = htons(HELLO_PORT),
     };
-    to.sin_addr.s_addr = inet_addr(PICO_IP);
 
-    hello_t h = { .magic = HELLO_MAGIC, .id = my_id };
+    hello_t h = { .magic = HELLO_MAGIC, .id = my_id, .board = my_board };
     while (1) {
-        sendto(sock, &h, sizeof(h), 0, (struct sockaddr *)&to, sizeof(to));  // fails harmlessly until WiFi is up
+        to.sin_addr.s_addr = pico_addr;   // follows the Pico if the router gives it a new IP
+        if (to.sin_addr.s_addr)           // wait until the first beacon tells us where the Pico is
+            sendto(sock, &h, sizeof(h), 0, (struct sockaddr *)&to, sizeof(to));
         vTaskDelay(pdMS_TO_TICKS(300));
     }
 }
@@ -148,8 +189,15 @@ static void sync_rx_task(void *arg)
 
     while (1) {
         beacon_t b;
-        int n = recv(sock, &b, sizeof(b), 0);
+        struct sockaddr_in from;
+        socklen_t from_len = sizeof(from);
+        int n = recvfrom(sock, &b, sizeof(b), 0, (struct sockaddr *)&from, &from_len);
         if (n != sizeof(b) || b.magic != SYNC_MAGIC || b.version != PROTO_VERSION) continue;
+
+        if (from.sin_addr.s_addr != pico_addr) {
+            pico_addr = from.sin_addr.s_addr;
+            ESP_LOGI(TAG, "Pico found at %s", inet_ntoa(from.sin_addr));
+        }
 
         int64_t now = esp_timer_get_time();
         if (!first && b.seq > expected) drops += b.seq - expected;

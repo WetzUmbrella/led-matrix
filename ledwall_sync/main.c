@@ -1,8 +1,11 @@
 // Pico W LED wall coordinator
-//  - runs the "LEDWALL" WiFi access point + DHCP
-//  - keeps a live list of panels (they send HELLO every 0.5s, dropped after 2s silence)
-//  - panels keep their number while alive; new panels take the lowest free number
-//  - picks the wall layout from the highest number in use (1=1x1, 2=2x1, 3=3x1, 4=2x2, ...)
+//  - USE_ROUTER 1: joins an external router (needed for 5+ panels, the Pico AP caps at 4 clients)
+//    USE_ROUTER 0: runs its own "LEDWALL" WiFi access point + DHCP (fallback, max 4 panels)
+//  - keeps a live list of panels (they send HELLO every 0.3s, dropped after 5s silence)
+//  - each panel has a permanent board number (ESP-1, ESP-2, ...), set once per board with
+//    panel_sync/set_board_number.sh
+//  - the wall is the panels connected right now, lined up by board number (lowest = top-left),
+//    so the GIF splits by how many are on: 1=1x1, 2=2x1, 3=3x1, 4=2x2, 5-6=3x2, 7-8=4x2
 //  - broadcasts a beacon 10x/s with the frame clock AND the layout (who is in which slot)
 
 #include <stdio.h>
@@ -13,13 +16,26 @@
 #include "lwip/udp.h"
 #include "dhcpserver.h"
 
-#define WIFI_SSID        "LEDWALL"
+#define USE_ROUTER       1             // 0 = Pico runs its own access point (max 4 panels)
+
+// Router credentials live in wifi_secrets.h (git-ignored, copy wifi_secrets.example.h)
+#if __has_include("wifi_secrets.h")
+#include "wifi_secrets.h"
+#elif USE_ROUTER
+#warning "wifi_secrets.h missing - using placeholder router credentials"
+#endif
+#ifndef ROUTER_SSID
+#define ROUTER_SSID      "CHANGE_ME"
+#define ROUTER_PASS      "CHANGE_ME"
+#endif
+
+#define WIFI_SSID        "LEDWALL"     // own access point, only used when USE_ROUTER is 0
 #define WIFI_PASS        "ledwall123"
 #define SYNC_PORT        4210          // Pico -> panels (broadcast)
 #define HELLO_PORT       4211          // panels -> Pico (unicast)
 #define SYNC_MAGIC       0x4C454457    // "LEDW"
 #define HELLO_MAGIC      0x48454C4F    // "HELO"
-#define PROTO_VERSION    2
+#define PROTO_VERSION    3             // 3: HELLO carries the board number
 #define FPS              30
 #define BEACON_MS        100
 #define NODE_TIMEOUT_MS  5000          // generous: a few lost HELLOs must not kick a panel out
@@ -43,15 +59,13 @@ typedef struct __attribute__((packed)) {
 typedef struct __attribute__((packed)) {
     uint32_t magic;
     uint32_t id;
+    uint8_t  board;               // board number from the panel's flash, 0 = never set
 } hello_t;
 
-// Slot table. A panel keeps its slot (its number) for as long as it stays alive.
-// slot_id[i] == 0 means slot i is empty. slot_last[i] remembers who last owned it,
-// so a panel that reboots or drops out briefly gets its OLD number back.
+// Who's connected, indexed by board number: board_id[n-1] is ESP-n's panel id, 0 = not connected.
 // Only touched with the lwIP lock held.
-static uint32_t slot_id[MAX_NODES];
-static uint32_t slot_seen[MAX_NODES];
-static uint32_t slot_last[MAX_NODES];
+static uint32_t board_id[MAX_NODES];
+static uint32_t board_seen[MAX_NODES];
 static uint8_t  layout_ver = 0;
 
 static void layout_for(int n, uint8_t *cols, uint8_t *rows)
@@ -66,26 +80,39 @@ static void layout_for(int n, uint8_t *cols, uint8_t *rows)
     }
 }
 
-// Grid size = highest occupied slot. Empty slots in the middle stay as dark holes,
-// so nobody else moves when a panel leaves.
-static int grid_slots(void)
+// Line up the connected panels by board number, no gaps. ids[k] is the panel in slot k
+// (slot 0 = top-left), boards[k] its board number. Returns how many are connected.
+static int pack_wall(uint32_t ids[MAX_NODES], uint8_t boards[MAX_NODES])
 {
     int n = 0;
-    for (int i = 0; i < MAX_NODES; i++)
-        if (slot_id[i]) n = i + 1;
+    memset(ids, 0, MAX_NODES * sizeof(ids[0]));
+    for (int i = 0; i < MAX_NODES; i++) {
+        if (!board_id[i]) continue;
+        ids[n] = board_id[i];
+        boards[n] = (uint8_t)(i + 1);
+        n++;
+    }
     return n;
 }
 
 static void print_layout(void)
 {
-    uint8_t c, r;
-    int n = grid_slots();
+    uint32_t ids[MAX_NODES];
+    uint8_t boards[MAX_NODES], c, r;
+    int n = pack_wall(ids, boards);
     layout_for(n, &c, &r);
-    printf("LAYOUT v%u: %d slot(s), %ux%u\n", layout_ver, n, c, r);
-    for (int i = 0; i < n; i++) {
-        if (slot_id[i]) printf("  panel %d -> %08lx\n", i + 1, (unsigned long)slot_id[i]);
-        else            printf("  panel %d -> (empty)\n", i + 1);
-    }
+    printf("LAYOUT v%u: %d panel(s), %ux%u\n", layout_ver, n, c, r);
+    for (int k = 0; k < n; k++)
+        printf("  slot %d -> ESP-%u (%08lx)\n", k + 1, boards[k], (unsigned long)ids[k]);
+}
+
+// HELLOs arrive every 0.3s, so rate-limit complaints about bad panels to one per 5s
+static bool warn_ok(uint32_t now)
+{
+    static uint32_t last = 0;
+    if (last && now - last < 5000) return false;
+    last = now;
+    return true;
 }
 
 // Called by lwIP (lock already held) when a HELLO arrives
@@ -99,42 +126,42 @@ static void hello_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p,
 
         uint32_t now = to_ms_since_boot(get_absolute_time());
 
-        for (int i = 0; i < MAX_NODES; i++) {
-            if (slot_id[i] == h.id) {             // already in the wall, just refresh
-                slot_seen[i] = now;
-                pbuf_free(p);
-                return;
-            }
+        if (h.board < 1 || h.board > MAX_NODES) {
+            if (warn_ok(now))
+                printf("IGNORED %08lx: board number %u not in 1-%d, run set_board_number.sh\n",
+                       (unsigned long)h.id, h.board, MAX_NODES);
+            pbuf_free(p);
+            return;
         }
 
-        // New (or returning) panel: take back its old slot if free, else the lowest free slot
-        int pick = -1;
-        for (int i = 0; i < MAX_NODES; i++)
-            if (!slot_id[i] && slot_last[i] == h.id) { pick = i; break; }
-        if (pick < 0)
-            for (int i = 0; i < MAX_NODES; i++)
-                if (!slot_id[i]) { pick = i; break; }
-
-        if (pick >= 0) {
-            slot_id[pick] = h.id;
-            slot_seen[pick] = now;
-            slot_last[pick] = h.id;
+        int s = h.board - 1;
+        if (board_id[s] == h.id) {                 // already in the wall, just refresh
+            board_seen[s] = now;
+        } else if (board_id[s]) {                  // two boards set to the same number
+            if (warn_ok(now))
+                printf("IGNORED %08lx: ESP-%u is already %08lx, give it another number\n",
+                       (unsigned long)h.id, h.board, (unsigned long)board_id[s]);
+        } else {
+            for (int i = 0; i < MAX_NODES; i++)    // board was renumbered: forget its old number
+                if (board_id[i] == h.id) board_id[i] = 0;
+            board_id[s] = h.id;
+            board_seen[s] = now;
             layout_ver++;
-            printf("JOIN  %08lx as panel %d\n", (unsigned long)h.id, pick + 1);
+            printf("JOIN  ESP-%u (%08lx)\n", h.board, (unsigned long)h.id);
             print_layout();
         }
     }
     pbuf_free(p);
 }
 
-// Free the slot of any panel we haven't heard from. Everyone else keeps their number.
+// Drop any panel we haven't heard from. The rest close up and the GIF re-splits.
 static void expire_nodes(uint32_t now)
 {
     bool changed = false;
     for (int i = 0; i < MAX_NODES; i++) {
-        if (slot_id[i] && now - slot_seen[i] > NODE_TIMEOUT_MS) {
-            printf("LEAVE %08lx (panel %d)\n", (unsigned long)slot_id[i], i + 1);
-            slot_id[i] = 0;
+        if (board_id[i] && now - board_seen[i] > NODE_TIMEOUT_MS) {
+            printf("LEAVE ESP-%d (%08lx)\n", i + 1, (unsigned long)board_id[i]);
+            board_id[i] = 0;
             changed = true;
         }
     }
@@ -144,6 +171,37 @@ static void expire_nodes(uint32_t now)
     }
 }
 
+#if USE_ROUTER
+// Join the router, retrying forever. Blocks until we have an IP from its DHCP.
+static void router_connect(void)
+{
+    int tries = 0;
+    uint32_t auth = ROUTER_PASS[0] ? CYW43_AUTH_WPA2_AES_PSK : CYW43_AUTH_OPEN;   // "" = open network
+    printf("Joining %s...\n", ROUTER_SSID);
+    while (cyw43_arch_wifi_connect_timeout_ms(ROUTER_SSID, ROUTER_PASS[0] ? ROUTER_PASS : NULL,
+                                              auth, 15000) != 0) {
+        printf("  join failed (try %d), retrying\n", ++tries);
+        cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, tries & 1);
+    }
+    cyw43_wifi_pm(&cyw43_state, CYW43_NONE_PM);      // radio never naps, fewer dropped packets
+}
+
+// Subnet broadcast (e.g. 192.168.1.255) from whatever address the router gave us
+static ip_addr_t router_bcast(void)
+{
+    struct netif *nif = &cyw43_state.netif[CYW43_ITF_STA];
+    cyw43_arch_lwip_begin();
+    uint32_t ip = ip4_addr_get_u32(netif_ip4_addr(nif));
+    uint32_t nm = ip4_addr_get_u32(netif_ip4_netmask(nif));
+    printf("Joined %s, ip=%s", ROUTER_SSID, ip4addr_ntoa(netif_ip4_addr(nif)));
+    cyw43_arch_lwip_end();
+
+    ip_addr_t bcast = IPADDR4_INIT(ip | ~nm);
+    printf(" bcast=%s\n", ipaddr_ntoa(&bcast));
+    return bcast;
+}
+#endif
+
 int main(void)
 {
     stdio_init_all();
@@ -152,6 +210,11 @@ int main(void)
         return 1;
     }
 
+#if USE_ROUTER
+    cyw43_arch_enable_sta_mode();
+    router_connect();
+    ip_addr_t bcast = router_bcast();
+#else
     cyw43_arch_enable_ap_mode(WIFI_SSID, WIFI_PASS, CYW43_AUTH_WPA2_AES_PSK);
     cyw43_wifi_pm(&cyw43_state, CYW43_NONE_PM);      // radio never naps, fewer dropped packets
 
@@ -169,6 +232,7 @@ int main(void)
 
     ip_addr_t bcast;
     IP4_ADDR(ip_2_ip4(&bcast), 192, 168, 4, 255);
+#endif
 
     cyw43_arch_lwip_begin();
     struct udp_pcb *tx = udp_new();
@@ -183,6 +247,15 @@ int main(void)
     uint32_t seq = 0;
 
     while (true) {
+#if USE_ROUTER
+        // Lost the router? Rejoin. Beacons pause, but panels keep animating on their own clock.
+        if (seq % 10 == 0 &&
+            cyw43_tcpip_link_status(&cyw43_state, CYW43_ITF_STA) != CYW43_LINK_UP) {
+            printf("Lost %s, rejoining\n", ROUTER_SSID);
+            router_connect();
+            bcast = router_bcast();
+        }
+#endif
         uint32_t now = to_ms_since_boot(get_absolute_time());
 
         beacon_t b;
@@ -196,9 +269,11 @@ int main(void)
         cyw43_arch_lwip_begin();
         expire_nodes(now);
         b.layout_ver = layout_ver;
-        b.count = (uint8_t)grid_slots();
+        uint32_t ids[MAX_NODES];
+        uint8_t boards[MAX_NODES];
+        b.count = (uint8_t)pack_wall(ids, boards);
         layout_for(b.count, &b.cols, &b.rows);
-        memcpy(b.ids, slot_id, sizeof(slot_id));        // 0 = empty slot
+        memcpy(b.ids, ids, sizeof(ids));                // b.ids is packed (unaligned), so copy
 
         struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, sizeof(b), PBUF_RAM);
         if (p) {
