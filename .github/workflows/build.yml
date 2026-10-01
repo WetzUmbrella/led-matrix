@@ -1,0 +1,74 @@
+# Builds every firmware project on each push / PR, so the README badge shows
+# whether the latest code compiles. Uses placeholder WiFi credentials
+# (wifi_secrets.example.h); real ones never leave your machine.
+name: Build firmware
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  esp32:
+    name: ESP32 (panel_sync, boardtest)
+    runs-on: ubuntu-latest
+    container: espressif/idf:v5.3      # same ESP-IDF version the team uses
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Placeholder WiFi credentials
+        run: cp panel_sync/main/wifi_secrets.example.h panel_sync/main/wifi_secrets.h
+
+      - name: Build panel_sync
+        run: |
+          . "$IDF_PATH/export.sh"
+          cd panel_sync
+          idf.py set-target esp32s3
+          idf.py build
+
+      - name: Build boardtest
+        run: |
+          . "$IDF_PATH/export.sh"
+          cd boardtest
+          idf.py set-target esp32s3
+          idf.py build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: panel_sync-bin
+          path: panel_sync/build/panel_sync.bin
+
+  pico:
+    name: Pico W (ledwall_sync)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake gcc-arm-none-eabi libnewlib-arm-none-eabi \
+            libstdc++-arm-none-eabi-newlib build-essential python3 libusb-1.0-0-dev
+
+      - name: Pico SDK 2.3.1 (same as the team)
+        run: |
+          git clone --depth 1 -b 2.3.1 https://github.com/raspberrypi/pico-sdk.git "$HOME/pico-sdk"
+          git -C "$HOME/pico-sdk" submodule update --init --depth 1 lib/cyw43-driver lib/lwip lib/tinyusb
+          echo "PICO_SDK_PATH=$HOME/pico-sdk" >> "$GITHUB_ENV"
+
+      - name: Placeholder WiFi credentials
+        run: cp ledwall_sync/wifi_secrets.example.h ledwall_sync/wifi_secrets.h
+
+      - name: Build ledwall_sync
+        run: |
+          mkdir -p ledwall_sync/build && cd ledwall_sync/build
+          cmake ..
+          make -j"$(nproc)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ledwall_sync-uf2
+          path: ledwall_sync/build/ledwall_sync.uf2
