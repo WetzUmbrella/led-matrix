@@ -131,9 +131,10 @@ sync messages go over WiFi, never pixels.
 1. Confirm 3x1 and 2x2 with all four boards; record `drops=` lines.
 2. Set DTIM 1 on the router and re-measure beacon loss. If it's still over 1%, add the double-send.
 3. Measure inter-panel skew (router vs Pico AP) for the report.
-4. Merge `router-mode` into `master`.
-5. Update the Week 6 design doc to match this page (router, 4-client limit, board numbering).
-6. Then the features: IMU orientation → Hall-sensor position → animation upload → 3D plate.
+4. Update the Week 6 design doc to match this page (router, 4-client limit, board numbering).
+5. Then the features: IMU orientation → Hall-sensor position → animation upload → 3D plate.
+
+(`router-mode` was merged into `master` on 2026-10-01.)
 
 ---
 
